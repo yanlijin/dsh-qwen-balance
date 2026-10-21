@@ -345,6 +345,21 @@ class Element {
   }
 }
 
+/**
+ * 可控时钟：lib/client.js 只用 Date.now()（自报节流）与 new Date(iso)（更新时间），
+ * 所以替换掉 vm 里的 Date 就能确定性地验证 5s 节流。
+ */
+let virtualDateNow = Date.parse('2026-10-21T04:00:00.000Z')
+class FakeDate extends Date {
+  constructor(...args) {
+    if (args.length === 0) super(virtualDateNow)
+    else super(...args)
+  }
+  static now() {
+    return virtualDateNow
+  }
+}
+
 function createEnv(options = {}) {
   const doc = { nodeType: 9 }
   const observers = new Set()
@@ -381,6 +396,7 @@ function createEnv(options = {}) {
 
   const context = {
     document: doc,
+    Date: FakeDate,
     navigator: { language: options.language === undefined ? 'zh-CN' : options.language },
     console: {
       warn: (...args) => warns.push(args.map((value) => String(value)).join(' ')),
@@ -482,6 +498,8 @@ function createEnv(options = {}) {
     },
     advance(ms) {
       const target = virtualNow + ms
+      // 自报节流用的是 Date.now()，让可控时钟跟着一起走。
+      virtualDateNow += ms
       for (;;) {
         let next = null
         for (const [id, timer] of timers) {
@@ -571,6 +589,18 @@ function buildSidebar(doc, options = {}) {
   return { frame, sidebarCol, ...tree }
 }
 
+/** 按路径筛请求：v0.1.1 之后 env.calls 里还混着 client-report 的 POST。 */
+const callsTo = (env, path) => env.calls.filter((call) => String(call.url).indexOf(path) === 0)
+const overviewCalls = (env) => callsTo(env, 'api/dsh-qwen-balance/overview')
+const refreshCalls = (env) => callsTo(env, 'api/dsh-qwen-balance/refresh')
+const reportCalls = (env) => callsTo(env, 'api/dsh-qwen-balance/client-report')
+const parseReport = (call) => JSON.parse(call.init.body)
+const lastReport = (env) => {
+  const calls = reportCalls(env)
+  if (calls.length === 0) return null
+  return { call: calls[calls.length - 1], body: parseReport(calls[calls.length - 1]) }
+}
+
 // ============================================================ 断言运行器
 let passed = 0
 let failed = 0
@@ -636,9 +666,9 @@ await check('取数用同源相对路径，渲染出 summary.value/sub', async (
   mod.apply({})
   await env.settle()
 
-  assert.equal(env.calls.length, 1, '首次应恰好取一次数')
-  assert.equal(env.calls[0].url, 'api/dsh-qwen-balance/overview?lang=zh')
-  assert.equal(env.calls[0].init.method, 'GET')
+  assert.equal(overviewCalls(env).length, 1, '首次应恰好取一次 overview')
+  assert.equal(overviewCalls(env)[0].url, 'api/dsh-qwen-balance/overview?lang=zh')
+  assert.equal(overviewCalls(env)[0].init.method, 'GET')
   const card = env.document.querySelector('[data-dsh-qwen-balance-card]')
   assert.ok(card.textContent.includes('¥263.66'), '卡片文本应含 summary.value：' + card.textContent)
   assert.ok(card.textContent.includes('代金券可用'), '卡片文本应含 summary.sub')
@@ -647,7 +677,7 @@ await check('取数用同源相对路径，渲染出 summary.value/sub', async (
   assert.equal(env.warns.length, 0, '正常路径不应有 warn：' + env.warns.join('|'))
 })
 
-await check('默认紧凑：展开区隐藏，rows/notes 都在隐藏的展开区里', async () => {
+await check('v0.1.1 默认展开：首次渲染明细行直接可见（无需点击）', async () => {
   const env = createEnv()
   buildSidebar(env.document)
   const mod = env.loadClient()
@@ -655,43 +685,107 @@ await check('默认紧凑：展开区隐藏，rows/notes 都在隐藏的展开�
   await env.settle()
   const card = env.document.querySelector('[data-dsh-qwen-balance-card]')
   const details = card.querySelector('[data-dsh-qwen-balance-details]')
-  assert.equal(details.style.display, 'none')
+  assert.equal(details.style.display, 'block', '首次渲染就应展开（不再需要点击）')
   const rows = card.querySelectorAll('[data-dsh-qwen-balance-row]')
-  assert.ok(rows.length > 0, 'rows 应已备好')
+  assert.equal(rows.length, SAMPLE.rows.length, 'rows 应全部渲染')
   for (const row of rows) {
-    assert.ok(details.contains(row), '未展开时 rows 必须留在隐藏的展开区内')
+    assert.ok(details.contains(row), 'rows 必须在展开区内')
     assert.equal(row.style.display, 'flex')
   }
   assert.ok(details.contains(card.querySelector('[data-dsh-qwen-balance-notes]')), 'notes 也在展开区内')
+  assert.ok(card.textContent.includes('券 923898490070'), 'rows 文本无需点击就已出现')
+  assert.ok(card.textContent.includes('未配置阿里云 AccessKey'), 'notes 文本无需点击就已出现')
   assert.equal(card.querySelector('[data-dsh-qwen-balance-error]').style.display, 'none')
+  assert.equal(refreshCalls(env).length, 0, '默认展开不应额外触发 refresh')
 })
 
-await check('点击卡片 → 展开 rows（文本）+ POST refresh', async () => {
+await check('v0.1.1 紧凑样式：弱化小标题 + 大数字 + 弱化明细 + 右上角箭头', async () => {
   const env = createEnv()
   buildSidebar(env.document)
   const mod = env.loadClient()
   mod.apply({})
   await env.settle()
   const card = env.document.querySelector('[data-dsh-qwen-balance-card]')
+  const head = card.querySelector('[data-dsh-qwen-balance-head]')
+  assert.ok(head, '头部应存在')
+  const titleEl = head.children[0]
+  const labelEl = head.children[1]
+  const dotEl = head.children[2]
+  const caretEl = head.children[3]
+  assert.equal(titleEl.textContent, '千问余额', '小标题应是卡片名')
+  assert.equal(titleEl.style.fontSize, '11px')
+  assert.equal(titleEl.style.color, 'var(--dsw-alias-label-secondary, #8b949e)', '小标题应弱化')
+  assert.equal(labelEl.textContent, '阿里云', '来源标签仍来自 payload.label')
+  assert.equal(dotEl.style.display, 'inline-block', '有 tone 时应显示状态点')
+  assert.equal(dotEl.getAttribute('data-tone'), 'good')
+  assert.equal(caretEl.style.marginLeft, 'auto', '箭头应贴在右上角')
+  assert.equal(caretEl.textContent, '▴', '展开态箭头朝上')
+
+  const valueEl = card.children[1]
+  const subEl = card.children[2]
+  assert.equal(valueEl.textContent, '¥263.66')
+  assert.equal(valueEl.style.fontSize, '19px', '数值应是大号字')
+  assert.equal(valueEl.style.fontWeight, '600')
+  assert.equal(subEl.textContent, '代金券可用', '限定语来自 payload.sub')
+  assert.equal(subEl.style.fontSize, '11px')
+  assert.equal(subEl.style.color, 'var(--dsw-alias-label-secondary, #8b949e)', '限定语应弱化')
+
+  const row = card.querySelector('[data-dsh-qwen-balance-row="coupon.total"]')
+  assert.equal(row.style.fontSize, '11px', '明细行应是弱化小字')
+  assert.ok(
+    card.querySelector('[data-dsh-qwen-balance-stamp]').textContent.includes('更新'),
+    '更新时间应来自宿主 checkedAt',
+  )
+  assert.ok(!card.textContent.includes('undefined'), '不得把 undefined 渲染出来')
+})
+
+await check('v0.1.1 点击整卡 → 收起；再点 → 展开（并 POST refresh）', async () => {
+  const env = createEnv()
+  buildSidebar(env.document)
+  const mod = env.loadClient()
+  mod.apply({})
+  await env.settle()
+  const card = env.document.querySelector('[data-dsh-qwen-balance-card]')
+  const details = card.querySelector('[data-dsh-qwen-balance-details]')
+  const caret = card.querySelector('[data-dsh-qwen-balance-head]').children[3]
+
   card.click()
   await env.settle()
+  assert.equal(details.style.display, 'none', '点击一次应收起')
+  assert.equal(caret.textContent, '▾', '收起态箭头朝下')
+  assert.equal(caret.getAttribute('aria-label'), '展开')
+  const postCall = refreshCalls(env).find((call) => call.init && call.init.method === 'POST')
+  assert.ok(postCall, '点击应触发 POST refresh')
+  assert.equal(postCall.url, 'api/dsh-qwen-balance/refresh?lang=zh')
 
-  const details = card.querySelector('[data-dsh-qwen-balance-details]')
-  assert.equal(details.style.display, 'block', '点击后应展开')
+  card.click()
+  await env.settle()
+  assert.equal(details.style.display, 'block', '再点应重新展开')
+  assert.equal(caret.textContent, '▴', '展开态箭头朝上')
   const rows = card.querySelectorAll('[data-dsh-qwen-balance-row]')
   assert.equal(rows.length, SAMPLE.rows.length, '应渲染全部 rows')
   assert.ok(card.textContent.includes('券 923898490070'), 'rows 文本应出现')
   assert.ok(card.textContent.includes('$7.66'), '网关剩余应出现')
   assert.ok(card.textContent.includes('现金余额'))
   assert.ok(card.textContent.includes('未配置阿里云 AccessKey'), 'notes 文本应出现')
-  const postCall = env.calls.find((call) => call.init && call.init.method === 'POST')
-  assert.ok(postCall, '点击应触发 POST refresh')
-  assert.equal(postCall.url, 'api/dsh-qwen-balance/refresh?lang=zh')
-
-  // 再次点击（点在卡片本体上）应收起
-  card.click()
-  await env.settle()
-  assert.equal(details.style.display, 'none', '再次点击应收起')
+  // SPEC §3.4：/refresh 只接受 POST，GET 会 405 —— 每次点击都必须 POST 刷新。
+  const refreshPosts = refreshCalls(env).filter((call) => call.init.method === 'POST')
+  assert.equal(refreshPosts.length, 2, '两次点击应各 POST 一次 refresh')
+  assert.equal(
+    refreshCalls(env).filter((call) => call.init.method !== 'POST').length,
+    0,
+    'refresh 端点绝不能走 GET（宿主只接受 POST，GET 会 405）',
+  )
+  assert.equal(
+    overviewCalls(env).filter((call) => call.init.method !== 'GET').length,
+    0,
+    'overview 只能是 GET',
+  )
+  assert.equal(
+    env.calls.filter((call) => call.init && call.init.method === 'POST' && String(call.url).indexOf('overview') === 0).length,
+    0,
+    'POST 不能打到 overview 上',
+  )
 })
 
 await check('tone 映射：good/normal/muted 都落到 data-tone + 颜色', async () => {
@@ -701,8 +795,7 @@ await check('tone 映射：good/normal/muted 都落到 data-tone + 颜色', asyn
   mod.apply({})
   await env.settle()
   const card = env.document.querySelector('[data-dsh-qwen-balance-card]')
-  card.click()
-  await env.settle()
+  // v0.1.1 默认展开，rows 已在 DOM 里，不需要点击。
   const tones = new Set(card.querySelectorAll('[data-tone]').map((el) => el.getAttribute('data-tone')))
   assert.ok(tones.has('good'), '应出现 good tone')
   assert.ok(tones.has('normal'), '应出现 normal tone')
@@ -721,7 +814,7 @@ await check('语言：navigator.language=en-US → lang=en', async () => {
   const mod = env.loadClient()
   mod.apply({})
   await env.settle()
-  assert.equal(env.calls[0].url, 'api/dsh-qwen-balance/overview?lang=en')
+  assert.equal(overviewCalls(env)[0].url, 'api/dsh-qwen-balance/overview?lang=en')
 })
 
 await check('30s 轮询：可见时轮询、document.hidden 暂停、可见后立刻补一次', async () => {
@@ -730,23 +823,24 @@ await check('30s 轮询：可见时轮询、document.hidden 暂停、可见后�
   const mod = env.loadClient()
   mod.apply({})
   await env.settle()
-  const initial = env.calls.length
+  const initial = overviewCalls(env).length
 
   env.advance(29999)
   await env.settle()
-  assert.equal(env.calls.length, initial, '未到 30s 不应取数')
+  assert.equal(overviewCalls(env).length, initial, '未到 30s 不应取数')
   env.advance(1)
   await env.settle()
-  assert.equal(env.calls.length, initial + 1, '满 30s 应轮询一次')
+  assert.equal(overviewCalls(env).length, initial + 1, '满 30s 应轮询一次')
 
   env.setHidden(true)
   env.advance(30000)
   await env.settle()
-  assert.equal(env.calls.length, initial + 1, 'hidden 时应暂停轮询')
+  assert.equal(overviewCalls(env).length, initial + 1, 'hidden 时应暂停轮询')
 
   env.setHidden(false)
   await env.settle()
-  assert.equal(env.calls.length, initial + 2, '可见时应立刻补一次')
+  assert.equal(overviewCalls(env).length, initial + 2, '可见时应立刻补一次')
+  assert.equal(overviewCalls(env).every((call) => call.init.method === 'GET'), true, '轮询/补一次都应是 GET')
 })
 
 await check('栏轨收起（data-sidebar-collapsed）隐藏卡片，恢复后重新显示', async () => {
@@ -894,6 +988,16 @@ await check('DOM 坏掉：apply 只 console.warn，绝不抛（不白屏）', ()
   assert.doesNotThrow(() => disposer())
   assert.ok(env.warns.length >= 1, '应至少 warn 一次')
   assert.ok(env.warns.join('|').includes('[dsh-qwen-balance]'))
+  // 挂载失败必须尽力自报：state=error、seat 全 false、error 文本带出来。
+  const failedReport = lastReport(env)
+  assert.ok(failedReport !== null, 'apply 抛错也应尽力自报')
+  assert.equal(failedReport.body.state, 'error')
+  assert.equal(failedReport.body.seat.sidebar, false)
+  assert.equal(failedReport.body.seat.foot, false)
+  assert.equal(failedReport.body.seat.usedFallback, false)
+  assert.equal(failedReport.body.rows, 0)
+  assert.equal(failedReport.body.expanded, true)
+  assert.ok(failedReport.body.error.includes('no dom here'), '错误文本应上报：' + failedReport.body.error)
 
   const env2 = createEnv()
   buildSidebar(env2.document)
@@ -918,6 +1022,9 @@ await check('幂等：重复 apply 只留一张卡片', async () => {
   mod.apply({})
   await env.settle()
   assert.equal(env.document.querySelectorAll('[data-dsh-qwen-balance-card]').length, 1)
+  const reports = reportCalls(env)
+  assert.equal(reports.length, 1, '幂等路径不应重复自报')
+  assert.equal(parseReport(reports[0]).state, 'mounted')
 })
 
 await check('请求失败：保留上次数据 + 追加一行错误', async () => {
@@ -1009,6 +1116,112 @@ await check('安全：不渲染 sources / 掩码以外的凭据信息', async ()
   assert.ok(!allText.includes('accessKeySecret'))
 })
 
+await check('v0.1.1 自报：seat 成功后 POST client-report，body 键/类型正确', async () => {
+  const env = createEnv()
+  buildSidebar(env.document)
+  const mod = env.loadClient()
+  mod.apply({})
+  await env.settle()
+  const reports = reportCalls(env)
+  assert.equal(reports.length, 1, '一次 seat 只自报一次（幂等 tick 不重复）')
+  assert.equal(reports[0].url, 'api/dsh-qwen-balance/client-report', '必须是同源相对路径')
+  assert.equal(reports[0].init.method, 'POST')
+  assert.ok(String(reports[0].init.headers['content-type']).includes('json'))
+  const body = parseReport(reports[0])
+  assert.equal(body.state, 'mounted')
+  assert.deepEqual(Object.keys(body.seat).sort(), ['foot', 'settings', 'sidebar', 'usedFallback'])
+  assert.equal(body.seat.sidebar, true, '找到侧栏列')
+  assert.equal(body.seat.foot, true, '找到 footArea')
+  assert.equal(body.seat.settings, true, '找到「设置」行座位')
+  assert.equal(body.seat.usedFallback, false, '没有用兜底座位')
+  assert.equal(typeof body.rows, 'number')
+  assert.equal(body.rows, 0, 'seat 时报的是当时的行数（数据还没回来）')
+  assert.equal(typeof body.expanded, 'boolean')
+  assert.equal(body.expanded, true, '默认展开状态要报上去')
+  assert.equal('error' in body, false, '正常挂载不带 error')
+  assert.ok(String(reports[0].init.body).includes('"state":"mounted"'))
+})
+
+await check('v0.1.1 自报：无「设置」座位时 usedFallback=true，reseat 上报实际行数', async () => {
+  const env = createEnv()
+  const frame = env.document.createElement('div')
+  frame.setAttribute('class', 'BynINW_frame')
+  const column = env.document.createElement('div')
+  column.setAttribute('class', 'BynINW_sidebarCol')
+  column._measuredWidth = 280
+  frame.appendChild(column)
+  env.document.body.appendChild(frame)
+  // 有 footArea，但没有 settingsArea → 走 foot 末尾兜底座位。
+  const foot = env.document.createElement('div')
+  foot.setAttribute('class', '_2H3hWW_footArea')
+  column.appendChild(foot)
+
+  const mod = env.loadClient()
+  mod.apply({})
+  await env.settle()
+  const first = lastReport(env)
+  assert.ok(first, '兜底座位也要自报')
+  assert.equal(first.body.seat.foot, true)
+  assert.equal(first.body.seat.settings, false)
+  assert.equal(first.body.seat.usedFallback, true)
+  assert.equal(first.body.state, 'mounted')
+  const card = env.document.querySelector('[data-dsh-qwen-balance-card]')
+  assert.ok(card && card.parentNode === foot, '兜底时卡片应落在 footArea 里')
+})
+
+await check('v0.1.1 自报节流：同 state 5s 内不重复，超过 5s 的 reseat 再报一次', async () => {
+  const env = createEnv()
+  buildSidebar(env.document)
+  const mod = env.loadClient()
+  mod.apply({})
+  await env.settle()
+  const card = env.document.querySelector('[data-dsh-qwen-balance-card]')
+  assert.equal(reportCalls(env).length, 1, '先有 1 条 mounted')
+
+  const knock = async () => {
+    env.mutate(() => {
+      env.document.body.appendChild(card)
+    })
+    await env.settle()
+  }
+
+  await knock()
+  assert.equal(reportCalls(env).length, 2, '第一次 reseat 应上报')
+  assert.equal(parseReport(reportCalls(env)[1]).state, 'reseated')
+  assert.equal(parseReport(reportCalls(env)[1]).rows, SAMPLE.rows.length, 'reseat 上报应带实际渲染行数')
+  assert.ok(card.nextElementSibling === env.document.querySelector('[class*="settingsArea"]'), '重挂后仍贴「设置」行')
+
+  await knock()
+  assert.equal(reportCalls(env).length, 2, '同一 state 5s 内不重复上报')
+
+  env.advance(6000)
+  await knock()
+  assert.equal(reportCalls(env).length, 3, '超过 5s 的 reseat 应再报一次')
+  assert.equal(parseReport(reportCalls(env)[2]).state, 'reseated')
+  assert.equal(env.warns.length, 0, '自报全程不应产生 warn：' + env.warns.join('|'))
+})
+
+await check('v0.1.1 自报失败不影响渲染（fetch 抛错也只是吞掉）', async () => {
+  const env = createEnv()
+  buildSidebar(env.document)
+  const mod = env.loadClient()
+  env.setFetch(async (url, init) => {
+    if (String(url).indexOf('client-report') === 0) throw new Error('report endpoint down')
+    return { ok: true, status: 200, json: async () => env.payload }
+  })
+  assert.doesNotThrow(() => mod.apply({}))
+  await env.settle()
+  const card = env.document.querySelector('[data-dsh-qwen-balance-card]')
+  assert.ok(card.textContent.includes('¥263.66'), '自报失败不能影响数据渲染')
+  assert.equal(card.getAttribute('data-dsh-qwen-balance-state'), 'ready')
+  assert.equal(reportCalls(env).length, 1, '仍然尝试上报过')
+  assert.equal(
+    env.warns.filter((line) => line.includes('report')).length,
+    0,
+    '自报失败必须静默吞掉：' + env.warns.join('|'),
+  )
+})
+
 await check('disposer：移除卡片、停掉轮询与自愈', async () => {
   const env = createEnv()
   const seat = buildSidebar(env.document)
@@ -1020,10 +1233,10 @@ await check('disposer：移除卡片、停掉轮询与自愈', async () => {
 
   disposer()
   assert.equal(env.document.querySelector('[data-dsh-qwen-balance-card]'), null, 'disposer 应移除卡片')
-  const before = env.calls.length
+  const before = overviewCalls(env).length
   env.advance(120000)
   await env.settle()
-  assert.equal(env.calls.length, before, 'disposer 后不应再轮询')
+  assert.equal(overviewCalls(env).length, before, 'disposer 后不应再轮询')
 
   seat.sidebarCol.textContent = ''
   buildSidebar(env.document)

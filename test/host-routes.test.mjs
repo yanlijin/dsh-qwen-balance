@@ -52,16 +52,16 @@ function offlineRuntime() {
 }
 
 /** Issue one real request against a loopback test server. */
-function request(port, path, { method = 'GET', headers = {} } = {}) {
+function request(port, path, { method = 'GET', headers = {}, body = undefined } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path, method, headers, agent: false }, (res) => {
-      let body = ''
+      let responseBody = ''
       res.setEncoding('utf8')
-      res.on('data', (chunk) => { body += chunk })
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }))
+      res.on('data', (chunk) => { responseBody += chunk })
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: responseBody }))
     })
     req.on('error', reject)
-    req.end()
+    req.end(body)
   })
 }
 
@@ -310,7 +310,7 @@ test('routes: a source-less configuration answers ok:false instead of failing', 
 
 /* ---------------------------------------------------------------- activation */
 
-test('apply: mounts two exact routes, and the disposer is idempotent', async (t) => {
+test('apply: mounts three exact routes, and the disposer is idempotent', async (t) => {
   // Keep the activation's background warm-up completely offline, even if the
   // developer's own environment holds real credentials.
   const saved = {}
@@ -344,15 +344,15 @@ test('apply: mounts two exact routes, and the disposer is idempotent', async (t)
 
   const dispose = apply(ctx, offlineConfig())
   assert.equal(typeof dispose, 'function')
-  assert.deepEqual(routes.map((route) => route.path), [`${API_PREFIX}/overview`, `${API_PREFIX}/refresh`])
-  assert.deepEqual(routes.map((route) => route.kind), ['exact', 'exact'])
+  assert.deepEqual(routes.map((route) => route.path), [`${API_PREFIX}/overview`, `${API_PREFIX}/refresh`, `${API_PREFIX}/client-report`])
+  assert.deepEqual(routes.map((route) => route.kind), ['exact', 'exact', 'exact'])
   assert.deepEqual(listeners.map(([event]) => event), ['loader/volatile-update'])
   assert.equal(typeof listeners[0][1], 'function')
 
   // Let the background warm-up settle, then tear down twice.
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.doesNotThrow(() => { dispose(); dispose() })
-  assert.deepEqual(routes, [], 'disposal must unregister both routes')
+  assert.deepEqual(routes, [], 'disposal must unregister every route')
 })
 
 test('apply: a disabled plugin mounts routes that report enabled:false', async (t) => {
@@ -367,4 +367,124 @@ test('apply: a disabled plugin mounts routes that report enabled:false', async (
   assert.equal(payload.error, 'disabled')
   assert.equal(payload.ok, false)
   assert.deepEqual(payload.rows, [])
+})
+
+/* ---------------------------------------- v0.1.1 client diagnostics (§3.6) */
+
+/** Post a client report over a real loopback socket. */
+function postReport(port, payload, { raw = null, headers = {} } = {}) {
+  return request(port, `${API_PREFIX}/client-report`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: raw ?? JSON.stringify(payload),
+  })
+}
+
+test('client-report: a valid report is accepted and surfaces as overview.client', async (t) => {
+  const runtime = offlineRuntime()
+  const server = await serve(createRoutes(runtime))
+  t.after(() => server.close())
+
+  const before = JSON.parse((await request(server.port, `${API_PREFIX}/overview`)).body)
+  assert.ok('client' in before, 'the field is always present on v0.1.1')
+  assert.equal(before.client, null, 'never-reported is null, not undefined')
+
+  const posted = await postReport(server.port, {
+    state: 'mounted',
+    seat: { sidebar: true, foot: true, settings: true, usedFallback: false },
+    rows: 4,
+    expanded: true,
+  })
+  assert.equal(posted.status, 200)
+  assert.deepEqual(JSON.parse(posted.body), { ok: true })
+
+  const after = JSON.parse((await request(server.port, `${API_PREFIX}/overview`)).body)
+  assert.deepEqual(Object.keys(after.client).sort(), ['at', 'error', 'expanded', 'rows', 'seat', 'state'])
+  assert.equal(after.client.state, 'mounted')
+  assert.deepEqual(after.client.seat, { sidebar: true, foot: true, settings: true, usedFallback: false })
+  assert.equal(after.client.rows, 4)
+  assert.equal(after.client.expanded, true)
+  assert.equal(after.client.error, null)
+  assert.ok(!Number.isNaN(Date.parse(after.client.at)), 'at is a host-generated ISO instant')
+
+  const refreshed = JSON.parse((await request(server.port, `${API_PREFIX}/refresh`, { method: 'POST' })).body)
+  assert.equal(refreshed.client.state, 'mounted', 'refresh carries the same diagnostics')
+  assert.equal(runtime.clientReportTotal(), 1)
+})
+
+test('client-report: the body is normalized and bounded before it is kept', async (t) => {
+  const runtime = offlineRuntime()
+  const server = await serve(createRoutes(runtime))
+  t.after(() => server.close())
+
+  const posted = await postReport(server.port, {
+    state: 'reseated',
+    seat: { sidebar: 1, foot: 0, settings: 'yes', usedFallback: null, extra: 'dropped' },
+    rows: 3.9,
+    expanded: 'no',
+    error: `  seat\n  failed   with   spaces  ${'x'.repeat(300)}`,
+    at: '1999-01-01T00:00:00.000Z',
+    seq: 999,
+    secret: 'must-not-be-kept',
+  })
+  assert.equal(posted.status, 200)
+
+  const client = JSON.parse((await request(server.port, `${API_PREFIX}/overview`)).body).client
+  assert.deepEqual(Object.keys(client.seat).sort(), ['foot', 'settings', 'sidebar', 'usedFallback'])
+  assert.deepEqual(client.seat, { sidebar: true, foot: false, settings: true, usedFallback: false })
+  assert.equal(client.rows, 3, 'rows is floored to a non-negative integer')
+  assert.equal(client.expanded, null, 'a non-boolean expanded is refused, not coerced')
+  assert.equal(client.error.length, 200)
+  assert.ok(!client.error.includes('\n'), 'whitespace is collapsed')
+  assert.ok(!('seq' in client) && !('secret' in client), 'unknown fields never reach the payload')
+  assert.notEqual(client.at, '1999-01-01T00:00:00.000Z', 'the host stamps at; the client cannot')
+})
+
+test('client-report: unusable bodies are refused with 400 and never stored', async (t) => {
+  const runtime = offlineRuntime()
+  const server = await serve(createRoutes(runtime))
+  t.after(() => server.close())
+
+  for (const payload of [{ state: 'exploded' }, {}, null, [], { state: 42 }]) {
+    const res = await postReport(server.port, payload)
+    assert.equal(res.status, 400, `unusable body must be 400: ${JSON.stringify(payload)}`)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: 'invalid client report' })
+  }
+  assert.equal((await postReport(server.port, null, { raw: '{"state":' })).status, 400)
+  assert.equal((await postReport(server.port, null, { raw: '' })).status, 400, 'an empty body is not a report')
+
+  assert.equal(runtime.clientReport(), null, 'nothing invalid may be stored')
+  assert.equal(runtime.clientReportTotal(), 0)
+})
+
+test('client-report: an oversized body is 413 and a wrong method is 405', async (t) => {
+  const runtime = offlineRuntime()
+  const server = await serve(createRoutes(runtime))
+  t.after(() => server.close())
+
+  const big = await postReport(server.port, { state: 'mounted', pad: 'x'.repeat(4000) })
+  assert.equal(big.status, 413)
+  assert.deepEqual(JSON.parse(big.body), { ok: false, error: 'payload too large' })
+
+  const wrong = await request(server.port, `${API_PREFIX}/client-report`, { method: 'GET' })
+  assert.equal(wrong.status, 405)
+  assert.deepEqual(JSON.parse(wrong.body), { ok: false, error: 'method not allowed' })
+
+  assert.equal(runtime.clientReport(), null)
+})
+
+test('client-report: a non-loopback caller is fenced out before the body is read', async () => {
+  const runtime = offlineRuntime()
+  const route = createRoutes(runtime).find((item) => item.path === `${API_PREFIX}/client-report`)
+  const req = fakeRequest({
+    url: `${API_PREFIX}/client-report`,
+    method: 'POST',
+    headers: { host: 'example.com' },
+    socket: { remoteAddress: '203.0.113.7' },
+  })
+  const res = fakeResponse()
+  await route.handler(req, res)
+  assert.equal(res.status, 403)
+  assert.deepEqual(JSON.parse(res.body), { ok: false, error: 'forbidden: loopback-only' })
+  assert.equal(runtime.clientReportTotal(), 0)
 })

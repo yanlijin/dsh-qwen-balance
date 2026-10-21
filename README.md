@@ -170,7 +170,7 @@ If your account is on the Alibaba Cloud international site, set the endpoint to 
 
 ## Card fields
 
-The host exposes one snapshot as JSON; the card renders it. The collapsed card shows the headline only; clicking it expands every row.
+The host exposes one snapshot as JSON; the card renders it. **Since v0.1.1 the card starts expanded**: the detail rows are on screen from the first render, with no click needed. Clicking the card collapses it, clicking again expands it — and every expand forces a fresh probe.
 
 | Field | Example | Meaning |
 | --- | --- | --- |
@@ -188,17 +188,22 @@ Row keys are stable; the visible `label` text follows the requested language. Th
 ### Polling and language
 
 - The **host** probes every `pollIntervalSec` seconds (default 60; allowed range 30–3600).
-- The **card** refreshes from the host every 30 seconds while the tab is visible, pauses while `document.hidden`, and forces a fresh probe when you click it.
+- The **card** refreshes from the host every 30 seconds while the tab is visible, pauses while `document.hidden`, and forces a fresh probe (`POST /refresh`) on every expand — including its first render in v0.1.1.
 - **Language**: Chinese when `navigator.language` starts with `zh`, otherwise English. `GET /api/dsh-qwen-balance/overview?lang=zh|en` overrides it per request. Only labels change — field names and numbers do not.
 
 ### HTTP surface
 
-Both routes are **loopback-only**:
+All three routes are **loopback-only**:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/dsh-qwen-balance/overview?lang=zh\|en` | Latest snapshot (probing once if there is none yet); `cache-control: no-store`. |
+| `GET` | `/api/dsh-qwen-balance/overview?lang=zh\|en` | Latest snapshot (probing once if there is none yet); `cache-control: no-store`; carries the `client` self-report block. |
 | `POST` | `/api/dsh-qwen-balance/refresh` | Probe now, then return the same structure. Any other method gets `405`. |
+| `POST` | `/api/dsh-qwen-balance/client-report` | **v0.1.1 diagnostics**: the card reports its own mount state; body capped at 2 KB; `200 {"ok":true}` on success. |
+
+`overview.client` is the last self-report the host recorded (`null` means the card never reported):
+`{ state, seat:{sidebar,foot,settings,usedFallback}, rows, expanded, error, at }`, where `at` is stamped by the host and cannot be forged by the client.
+An unusable body gets `400`, an oversized one `413`, a non-`POST` `405`. The endpoint exists only to answer "did the card actually mount, and does it react to clicks"; it collects no user data.
 
 A request from a non-loopback address gets `403 {"ok":false,"error":"forbidden: loopback-only"}`. When no source is configured the response is still `200`, with `ok:false`, empty `rows` and a guidance line in `notes`. One failing source never hides the others: the failure is recorded in that source's `state`/`error` plus one note line.
 
@@ -223,6 +228,7 @@ All probing uses Node's `http`/`https` modules with `agent: false`; the timeout 
 | A gateway row shows an error and the raw response looks like a web page | An old one-api build without the billing endpoints (it answers `200` + HTML). | Use `kind: user-balance` if that gateway supports `/user/balance`; otherwise it has no quota endpoint. |
 | The card shows only a configuration hint | No source is configured (or all are disabled). | Set an AccessKey (environment variable, AK file, or config) or add a `gateways[]` entry. |
 | No card in the sidebar | The plugin is disabled, not installed in this profile, or `dsh web` was not restarted after install. | Check `enabled`, check that you added the plugin to the profile you are running, restart `dsh web`, then refresh the page. |
+| The card is visible but **clicking it does nothing** | v0.1.0's click handler fired `GET /refresh` first, while the host only accepts `POST` (GET returns `405`) — so "click to expand" looked completely dead. | Upgrade to **v0.1.1** (starts expanded, clicks use `POST /refresh`). If it still misbehaves, read the `client` block in `GET /api/dsh-qwen-balance/overview`: it records the card's self-reported mount, seat, row count and expanded state. |
 | Coupon row is empty although `sk-` billing works in the console | Expected: coupons are only visible through BSS + AccessKey. | Configure an AccessKey with `bss:DescribeCoupons`. |
 
 Failed probes keep the previous numbers on screen and add an error row, so a temporary network problem does not blank the card.

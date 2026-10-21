@@ -1,6 +1,6 @@
 {
   "name": "dsh-qwen-balance",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Qwen / DashScope and Alibaba Cloud balance card for the DSH web GUI: account balance, student coupons, and OpenAI-compatible gateway quotas, in a compact sidebar foot card. · 千问/百炼与阿里云余额卡片：阿里云可用额度、学生代金券、中转站额度，侧栏一张小卡片看全。",
   "keywords": [
     "deepseek",

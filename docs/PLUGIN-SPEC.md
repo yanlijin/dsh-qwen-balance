@@ -59,6 +59,7 @@ export const apply = (ctx, config) => { /* 返回 disposer */ }
 | --- | --- | --- |
 | GET | `/api/dsh-qwen-balance/overview?lang=zh\|en` | 返回最近快照（必要时触发一次抓取）；`cache-control: no-store` |
 | POST | `/api/dsh-qwen-balance/refresh` | 立即抓一次后返回同一结构；非 POST → 405 |
+| POST | `/api/dsh-qwen-balance/client-report` | **v0.1.1 追加**：浏览器半上报自身挂载状态（诊断用，契约见 §3.6）；非 POST → 405 |
 
 - 非环回请求 → `403 {ok:false,error:"forbidden: loopback-only"}`
 - 未知路径不注册（由宿主回 404）
@@ -87,7 +88,8 @@ export const apply = (ctx, config) => { /* 返回 disposer */ }
     "gateways": [ { "id": "gw1", "name": "中转站", "kind": "newapi", "state": "ok", "error": null,
                     "currency": "USD", "total": 20, "used": 12.34, "remaining": 7.66, "balance": null } ]
   },
-  "error": null                     // 插件禁用时为 "disabled"
+  "error": null,                    // 插件禁用时为 "disabled"
+  "client": null                    // v0.1.1 追加：浏览器半最后一次自报；从未上报时 null（见 §3.6）
 }
 ```
 
@@ -97,6 +99,7 @@ export const apply = (ctx, config) => { /* 返回 disposer */ }
 - 单个来源失败不影响其它来源；失败写进该来源的 `state/error`，并追加一条 `note`
 - 数值字段一律为 `number | null`，**不要**把 `undefined` 序列化进 JSON
 - `lang` 只影响 `summary.label/rows[].label/notes` 文案，字段名与数值不变
+- **v0.1.1 追加字段**：`client`（`null` 或 `{at,state,seat,rows,expanded,error}`）。这是**追加**——v0.1.0 的字段名、类型、语义一个都没有改动
 
 ### 3.4 配置 schema（自动生成的插件配置表单）
 
@@ -143,6 +146,23 @@ AK 解析优先级：**环境变量 > AK 文件 > 插件配置**
 - 网关探测按 `kind`：`auto` = 先 `/dashboard/billing/subscription`（`hard_limit_usd`）再 `/dashboard/billing/usage`（`total_usage` 单位**美分**，/100）；抓不到再试 `/user/balance`（`balance_infos[]`）；旧版 one-api 会对未知路由回 `200 + HTML`，必须识别并降级为 error
 - 超时默认 15s；任一来源的异常必须被捕获成 `state:'error'` + 简短消息，**不得**冒泡成 500
 
+### 3.6 v0.1.1 追加：`client-report` 与 `client` 字段（向后兼容）
+
+为什么有：卡片「有没有挂上、点了有没有反应」在宿主侧原本完全不可观测——用户实测报「点着没反应」时只能靠截图猜。所以浏览器半在每次 seat 成功后自报一次，宿主把它带回 `overview.client`。
+
+`POST /api/dsh-qwen-balance/client-report`
+
+| 项 | 约定 |
+| --- | --- |
+| 请求体 | JSON 对象，≤ 2048 字节；`state` 必须是 `mounted` / `reseated` / `error` 之一 |
+| 成功 | `200 {ok:true}`，并记为「最后一次上报」保存在宿主内存（**不落盘、不写日志正文**） |
+| 非法 state / 非 JSON / 非对象 | `400 {ok:false,error:"invalid client report"}` |
+| 超过 2048 字节 | `413 {ok:false,error:"payload too large"}` |
+| 非 POST（含 GET/HEAD） | `405 {ok:false,error:"method not allowed"}` |
+| 非环回 | `403 {ok:false,error:"forbidden: loopback-only"}` |
+
+字段归一化（宿主强制，`normalizeClientReport`）：`seat` 只保留 `{sidebar,foot,settings,usedFallback}` 四个布尔；`rows` 取非负整数；`expanded` 取布尔；`error` 截断 200 字符并压平空白；其余字段一律丢弃。`overview.client` 的 `at` 由**宿主**填（收到时刻的 ISO 串），不采信客户端时间。
+
 ## 4. 客户端半契约（`lib/client.js`）
 
 - 文件形态（**必须**，宿主按此加载）：
@@ -164,14 +184,15 @@ window.__ModuleLoader__.load({
 - `apply` 里：往侧栏「设置」行上方插入 `<div data-dsh-qwen-balance-card>`，内部自己渲染（纯 DOM，不用 React）；页面无该座位时静默不挂载
 - 取数：同源相对路径 `api/dsh-qwen-balance/overview?lang=<zh|en>`（GUI 以 `<base href="./">` 提供，**不要**写 `/api/...` 绝对路径）
 - 轮询：标签页可见时 30s；`document.hidden` 时暂停；`POST api/dsh-qwen-balance/refresh` 用于点击刷新
-- 渲染要求：紧凑（默认 1~2 行摘要）；点击展开全部 `rows`；`tone` 映射颜色（good/normal/muted/warn）；出错显示一行错误 + 上次数据保留
+- 渲染要求：紧凑；**v0.1.1 起默认展开**——首次渲染就把全部 `rows` 显示出来（用户要求「打开就能看、不用点」），点击整卡 = 收起/展开 + 强制刷新一次；`tone` 映射颜色（good/normal/muted/warn）；出错显示一行错误 + 上次数据保留
+- **v0.1.1 起自报挂载状态**：每次 seat/reseat 成功后 `POST api/dsh-qwen-balance/client-report`，body `{state, seat:{sidebar,foot,settings,usedFallback}, rows, expanded, error?}`（同一 state 5s 内不重复上报；`apply` 抛错时尽力上报 `{state:'error',error}`）；上报必须 try/catch 吞掉，**绝不允许影响渲染或轮询**
 - 任何异常都不能让侧栏白屏：整个 `apply` 用 try/catch 包住，出错只 console.warn
 - 语言：`navigator.language` 以 `zh` 开头 → `zh`，否则 `en`
 
 ## 5. 安全红线（验证方会重点打）
 
 1. 浏览器侧永远拿不到、也永远不请求任何密钥；`overview` 里只有 `akIdMasked`
-2. `/overview`、`/refresh` 非环回一律 403
+2. `/overview`、`/refresh`、`/client-report` 非环回一律 403
 3. 日志、错误消息、notes 里不得出现明文 AK / STS / 网关 key（只有掩码）
 4. 代金券余额是**独立**于「可用额度」的数字，文案不得暗示已计入可用额度
 5. `README` 必须说清：AK 建议用环境变量或 `~/.dsh/qwen-coupon.json`，插件配置里的明文只作最后兜底
@@ -184,3 +205,4 @@ window.__ModuleLoader__.load({
 - 不配置任何来源时不报错，只给配置引导
 - 断网/错误 AK 时卡片保留上次数据并显示错误行
 - README（中英）+ LICENSE + 收录 PR 物料齐备
+- **v0.1.1 增量验收**（独立复验见 `out/plugin-verify/delta-v011-verify.md`）：`client-report` 的 200/400/413/405/403 全覆盖、`overview.client` 反映最后一次上报、v0.1.0 字段清单除新增 `client` 外零改动、客户端默认展开 + 上报 body 正确 + 上报失败不影响渲染

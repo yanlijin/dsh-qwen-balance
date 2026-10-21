@@ -170,7 +170,7 @@ DSH 的 **profile** 是 `%USERPROFILE%\.dsh\profiles\<name>` 下一个具名的�
 
 ## 卡片字段
 
-宿主把最近一次快照以 JSON 形式暴露出来，卡片只负责渲染。收起时只显示头条，点击后展开全部行。
+宿主把最近一次快照以 JSON 形式暴露出来，卡片只负责渲染。**v0.1.1 起默认展开**：首次渲染就显示明细行，不用点；点一下整卡可以收起，再点一次展开，展开时会立刻强制探测一次。
 
 | 字段 | 示例 | 含义 |
 | --- | --- | --- |
@@ -188,17 +188,22 @@ DSH 的 **profile** 是 `%USERPROFILE%\.dsh\profiles\<name>` 下一个具名的�
 ### 轮询与语言
 
 - **宿主**每 `pollIntervalSec` 秒探测一次（默认 60，允许 30–3600）。
-- **卡片**在标签页可见时每 30 秒向宿主取一次，`document.hidden` 时暂停；点击卡片会立刻强制探测一次。
+- **卡片**在标签页可见时每 30 秒向宿主取一次，`document.hidden` 时暂停；每次展开（含 v0.1.1 的首次渲染）都会 `POST /refresh` 强制探测一次。
 - **语言**：`navigator.language` 以 `zh` 开头用中文，否则用英文；`GET /api/dsh-qwen-balance/overview?lang=zh|en` 可按单次请求覆盖。语言只影响文案，不影响字段名与数值。
 
 ### HTTP 接口
 
-两个路由都**只允许环回**：
+三个路由都**只允许环回**：
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/dsh-qwen-balance/overview?lang=zh\|en` | 最近一次快照（还没有就触发一次抓取）；`cache-control: no-store`。 |
+| `GET` | `/api/dsh-qwen-balance/overview?lang=zh\|en` | 最近一次快照（还没有就触发一次抓取）；`cache-control: no-store`；含 `client` 自报块。 |
 | `POST` | `/api/dsh-qwen-balance/refresh` | 立即探测一次后返回同一结构。其它方法返回 `405`。 |
+| `POST` | `/api/dsh-qwen-balance/client-report` | **v0.1.1 诊断**：卡片自报挂载状态，body 上限 2 KB，成功返回 `200 {"ok":true}`。 |
+
+`overview.client` 是宿主记录的最后一次卡片自报（`null` 表示这张卡从未上报过）：
+`{ state, seat:{sidebar,foot,settings,usedFallback}, rows, expanded, error, at }` —— 其中 `at` 由宿主盖章，客户端伪造不了。
+非法 body 返回 `400`，超过 2 KB 返回 `413`，非 `POST` 返回 `405`。这个端点只用来回答「卡片到底有没有挂上、点了有没有反应」，不采集任何用户数据。
 
 非环回地址的请求一律 `403 {"ok":false,"error":"forbidden: loopback-only"}`。一个来源都没配置时，响应仍是 `200`，只是 `ok:false`、`rows` 为空、`notes` 里带一行配置引导。单个来源失败不会遮住其它来源：失败写进该来源的 `state`/`error`，并追加一条 note。
 
@@ -223,6 +228,7 @@ DSH 的 **profile** 是 `%USERPROFILE%\.dsh\profiles\<name>` 下一个具名的�
 | 中转站行报错，原始响应看起来是一个网页 | 旧版 one-api 没有 billing 端点（它对未知路由回 `200` + HTML）。 | 若该网关支持 `/user/balance`，改用 `kind: user-balance`；否则它确实没有额度接口。 |
 | 卡片只显示一行配置引导 | 一个来源都没配置（或全部被关掉）。 | 配置 AccessKey（环境变量 / AK 文件 / 插件配置），或添加一条 `gateways[]`。 |
 | 侧栏里根本没有卡片 | 插件被停用、没装进当前 profile，或装完没有重启 `dsh web`。 | 检查 `enabled`、确认装进了正在运行的那个 profile、重启 `dsh web`，然后刷新页面。 |
+| 卡片在侧栏里看得到，但**点了没反应** | v0.1.0 的点击会先 `GET /refresh`，而宿主只接受 `POST`（GET 返回 `405`），所以「点击展开」看起来毫无反应。 | 升级到 **v0.1.1**（默认展开 + 点击走 `POST /refresh`）；升级后仍异常，看 `GET /api/dsh-qwen-balance/overview` 里的 `client` 块，它记录了卡片自报的挂载 / 座位 / 行数 / 展开状态。 |
 | 控制台里 `sk-` 账单正常，代金券行却是空的 | 正常现象：代金券只能通过 BSS + AccessKey 看到。 | 配置一个带 `bss:DescribeCoupons` 的 AccessKey。 |
 
 探测失败时卡片会保留上一次的数字并追加一行错误，因此临时断网不会让卡片变空白。
