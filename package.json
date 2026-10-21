@@ -1,0 +1,62 @@
+{
+  "name": "dsh-qwen-balance",
+  "version": "0.1.0",
+  "description": "Qwen / DashScope and Alibaba Cloud balance card for the DSH web GUI: account balance, student coupons, and OpenAI-compatible gateway quotas, in a compact sidebar foot card. · 千问/百炼与阿里云余额卡片：阿里云可用额度、学生代金券、中转站额度，侧栏一张小卡片看全。",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "qwen",
+    "dashscope",
+    "alibaba-cloud",
+    "balance",
+    "coupon"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yanlijin/dsh-qwen-balance.git"
+  },
+  "homepage": "https://github.com/yanlijin/dsh-qwen-balance#readme",
+  "bugs": {
+    "url": "https://github.com/yanlijin/dsh-qwen-balance/issues"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "docs",
+    "tools"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.2"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
